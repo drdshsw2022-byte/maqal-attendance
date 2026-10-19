@@ -3,13 +3,18 @@
 Flask + SQLite. يوفّر واجهة JSON للتطبيق، ويصدّر كشوف Excel.
 """
 import hashlib
+import base64
 import hmac
+import html
 import io
+import json
 import os
 import re
 import secrets
 import sqlite3
 import time
+import urllib.parse
+import urllib.request
 from functools import wraps
 
 from flask import Flask, g, jsonify, request, send_file
@@ -65,6 +70,7 @@ CREATE TABLE IF NOT EXISTS assignments(
   PRIMARY KEY(doctor_id, course_id)
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS oauth_pending(nonce TEXT PRIMARY KEY, device TEXT, token TEXT, error TEXT, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
@@ -119,6 +125,21 @@ def _clear(key):
 def norm_email(v):
     v = (v or "").strip().lower()
     return v if EMAIL_RE.match(v) else None
+
+
+def google_exchange(code, redirect_uri):
+    """يبدّل رمز Google بالبريد الموثّق. يُستبدل في الاختبارات."""
+    data = urllib.parse.urlencode({
+        "code": code, "client_id": os.environ["MAQAL_GOOGLE_CLIENT_ID"],
+        "client_secret": os.environ["MAQAL_GOOGLE_CLIENT_SECRET"],
+        "redirect_uri": redirect_uri, "grant_type": "authorization_code"}).encode()
+    with urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=data), timeout=15) as r:
+        tok = json.loads(r.read().decode())
+    payload = tok["id_token"].split(".")[1]
+    info = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if not info.get("email_verified"):
+        return None
+    return (info.get("email") or "").lower()
 
 
 def create_app(db_path=None, secret=None):
@@ -316,7 +337,99 @@ def create_app(db_path=None, secret=None):
                 db().execute("UPDATE users SET device_id=? WHERE id=?", (device, u["id"]))
                 db().commit()
         _clear(key)
+        want = (d.get("role") or "").strip()
+        if want and want != u["role"]:
+            names = {"student": "طالب", "doctor": "دكتور", "admin": "مدير"}
+            return err("wrong_role", f"هذا الحساب ليس حساب {names.get(want, want)}. اختر الدور الصحيح.", 403)
         return jsonify({"token": issue_token(u), "user": public_user(u)})
+
+    # ---- الدخول بحساب Google (عبر المتصفح، والتطبيق يستعلم بالـ nonce)
+    def public_base():
+        return (os.environ.get("MAQAL_PUBLIC_URL") or request.url_root).rstrip("/")
+
+    @app.get("/api/auth/options")
+    def auth_options():
+        return jsonify({"google": bool(os.environ.get("MAQAL_GOOGLE_CLIENT_ID"))})
+
+    def done_page(ok, msg):
+        color = "#16a34a" if ok else "#dc2626"
+        return (f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<body style="font-family:sans-serif;text-align:center;padding:48px 20px;direction:rtl">'
+                f'<h2 style="color:{color}">{"تم" if ok else "تعذّر الدخول"}</h2><p>{html.escape(msg)}</p></body>')
+
+    @app.get("/auth/google/start")
+    def google_start():
+        cid = os.environ.get("MAQAL_GOOGLE_CLIENT_ID")
+        nonce = (request.args.get("nonce") or "").strip()
+        if not cid:
+            return done_page(False, "الدخول بحساب Google غير مفعّل على هذا الخادم."), 503
+        if not 16 <= len(nonce) <= 64:
+            return done_page(False, "طلب غير صالح."), 400
+        db().execute("DELETE FROM oauth_pending WHERE created<?", (now() - 600,))
+        db().execute("INSERT OR REPLACE INTO oauth_pending(nonce,device,created) VALUES(?,?,?)",
+                     (nonce, (request.args.get("device") or "").strip(), now()))
+        db().commit()
+        q = urllib.parse.urlencode({
+            "client_id": cid, "redirect_uri": public_base() + "/auth/google/callback", "response_type": "code",
+            "scope": "openid email", "state": nonce, "prompt": "select_account"})
+        return "", 302, {"Location": "https://accounts.google.com/o/oauth2/v2/auth?" + q}
+
+    @app.get("/auth/google/callback")
+    def google_callback():
+        nonce = request.args.get("state") or ""
+        row = db().execute("SELECT * FROM oauth_pending WHERE nonce=?", (nonce,)).fetchone()
+        if not row or request.args.get("error") or not request.args.get("code"):
+            return done_page(False, "أُلغي الدخول أو انتهت صلاحية الطلب. ارجع للتطبيق وأعد المحاولة."), 400
+
+        def fail(m):
+            db().execute("UPDATE oauth_pending SET error=? WHERE nonce=?", (m, nonce))
+            db().commit()
+            return done_page(False, m), 403
+        try:
+            email = google_exchange(request.args["code"], public_base() + "/auth/google/callback")
+        except Exception:
+            return fail("تعذّر التحقق من حساب Google.")
+        if not email:
+            return fail("بريد Google غير موثّق.")
+        u = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if not u:
+            return fail(f"البريد {email} غير مرتبط بأي حساب. اطلب من الإدارة ربطه، أو فعّل حسابك واكتب هذا البريد.")
+        if u["role"] == "student" and not u["activated"]:
+            return fail("هذا الحساب لم يُفعَّل بعد.")
+        if not u["active"]:
+            return fail("الحساب موقوف، راجع إدارة الجامعة.")
+        if u["role"] == "student":
+            device = row["device"]
+            if not device:
+                return fail("تعذّر تحديد الجهاز.")
+            if u["device_id"] and u["device_id"] != device:
+                return fail("هذا الحساب مرتبط بهاتف آخر. راجع إدارة الجامعة.")
+            if not u["device_id"]:
+                db().execute("UPDATE users SET device_id=? WHERE id=?", (device, u["id"]))
+        db().execute("UPDATE oauth_pending SET token=? WHERE nonce=?", (issue_token(u), nonce))
+        db().commit()
+        return done_page(True, "ارجع الآن إلى تطبيق حضور المعقل.")
+
+    @app.get("/api/auth/google/poll")
+    def google_poll():
+        nonce = request.args.get("nonce") or ""
+        row = db().execute("SELECT * FROM oauth_pending WHERE nonce=?", (nonce,)).fetchone()
+        if not row:
+            return err("expired", "انتهت صلاحية الطلب", 404)
+        if row["error"]:
+            db().execute("DELETE FROM oauth_pending WHERE nonce=?", (nonce,))
+            db().commit()
+            return err("google_failed", row["error"], 403)
+        if not row["token"]:
+            return jsonify({"status": "pending"})
+        want = (request.args.get("role") or "").strip()
+        data = auth_s.loads(row["token"])
+        u = db().execute("SELECT * FROM users WHERE id=?", (data["u"],)).fetchone()
+        db().execute("DELETE FROM oauth_pending WHERE nonce=?", (nonce,))
+        db().commit()
+        if want and want != u["role"]:
+            return err("wrong_role", "هذا الحساب ليس من الدور المختار. اختر الدور الصحيح.", 403)
+        return jsonify({"status": "ok", "token": row["token"], "user": public_user(u)})
 
     @app.post("/api/auth/activate")
     def activate():
