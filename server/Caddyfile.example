@@ -1,0 +1,4 @@
+# HTTPS تلقائي. بدّل الدومين بدومين جامعتك ثم: caddy run --config Caddyfile.example
+attendance.example.edu.iq {
+    reverse_proxy 127.0.0.1:8000
+}
