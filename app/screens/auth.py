@@ -1,6 +1,8 @@
 """شاشات الدخول وتفعيل حساب الطالب."""
 import os
+import uuid
 
+from kivy.clock import Clock
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.image import Image
@@ -8,7 +10,7 @@ from kivy.uix.screenmanager import Screen
 
 from screens.common import app
 from theme import ASSETS, C, GRAD
-from widgets import ALabel, Btn, Card, Field, GradBox, Icon, IconBtn, RBox, Spacer, VScroll, toast
+from widgets import ALabel, Btn, Card, Chips, Field, GradBox, Icon, IconBtn, RBox, Spacer, VScroll, ar, toast
 
 
 class ChoiceList(BoxLayout):
@@ -43,23 +45,37 @@ def header_block(title, subtitle):
     return box
 
 
+ROLES = [("student", "طالب"), ("doctor", "دكتور"), ("admin", "مدير")]
+ROLE_HINT = {"student": "الرقم المعرفي (10 أرقام) أو البريد", "doctor": "البريد الإلكتروني (Gmail)",
+             "admin": "البريد الإلكتروني للمدير"}
+
+
 class LoginScreen(Screen):
+    role = "student"
+    _poll = None
+
     def __init__(self, **kw):
         super().__init__(name="login", **kw)
         bg = GradBox(stops=GRAD["login"], vertical=True)
         sc = VScroll(padding=0, spacing=0)
         sc.add(header_block("جامعة المعقل الأهلية", "البصرة · نظام الحضور والغياب الذكي"))
-        card = Card(size_hint_y=None, height=dp(430), padding=[dp(20), dp(22)], spacing=dp(6), radius=dp(30))
+        card = Card(size_hint_y=None, height=dp(535), padding=[dp(20), dp(22)], spacing=dp(6), radius=dp(30))
         card.add_widget(ALabel("تسجيل الدخول", bold=True, font_size=sp(21), size_hint_y=None, height=dp(34), wrap=False))
-        self.ident = Field("الرقم الجامعي أو البريد الإلكتروني (Gmail)", icon="person")
+        self.roles = Chips(ROLES, selected="student", on_select=self.set_role)
+        card.add_widget(self.roles)
+        self.ident = Field("الرقم الجامعي أو البريد الإلكتروني (Gmail)", icon="person", hint=ROLE_HINT["student"])
         self.pw = Field("كلمة المرور", icon="lock", password=True)
         card.add_widget(self.ident)
         card.add_widget(self.pw)
         self.go = Btn("دخول", icon="check", on_release=lambda *_: self.submit())
         card.add_widget(self.go)
-        card.add_widget(ALabel("طالب جديد؟ فعّل حسابك بالرقم المعرفي أول مرة", color=C.muted, font_size=sp(13),
-                               halign="center", size_hint_y=None, height=dp(30)))
-        card.add_widget(Btn("تفعيل حساب الطالب", icon="reg", kind="soft", on_release=lambda *_: app().open("activate")))
+        card.add_widget(Btn("الدخول بحساب Google", icon="mail", kind="soft", color=C.rose, height=48,
+                            on_release=lambda *_: self.google()))
+        self.act_note = ALabel("طالب جديد؟ فعّل حسابك بالرقم المعرفي أول مرة", color=C.muted, font_size=sp(13),
+                               halign="center", size_hint_y=None, height=dp(30))
+        card.add_widget(self.act_note)
+        self.act_btn = Btn("تفعيل حساب الطالب", icon="reg", kind="soft", on_release=lambda *_: app().open("activate"))
+        card.add_widget(self.act_btn)
         card.add_widget(Btn("إعدادات الخادم", icon="dns", kind="soft", color=C.muted, height=44,
                             on_release=lambda *_: app().server_dialog()))
         wrap = BoxLayout(orientation="vertical", size_hint_y=None, padding=[dp(14), 0, dp(14), dp(24)])
@@ -72,13 +88,56 @@ class LoginScreen(Screen):
     def on_pre_enter(self, *_):
         self.pw.text = ""
 
+    def set_role(self, key):
+        self.role = key
+        self.ident.input.hint_text = ar(ROLE_HINT[key])
+        stu = key == "student"
+        for w in (self.act_note, self.act_btn):
+            w.opacity = 1 if stu else 0
+            w.disabled = not stu
+
+    def google(self):
+        a = app()
+        if not a.server_url:
+            toast("اضبط عنوان الخادم أولاً (إعدادات الخادم)", "err")
+            return
+        from qr import open_url
+        nonce = uuid.uuid4().hex
+        self._tries = 0
+        self._nonce = nonce
+        open_url(f"{a.api.base}/auth/google/start?nonce={nonce}&device={a.device_id}")
+        toast("أكمل الدخول في المتصفح ثم ارجع للتطبيق", "info")
+        if self._poll:
+            self._poll.cancel()
+        self._poll = Clock.schedule_interval(self._check, 2.5)
+
+    def _check(self, _dt):
+        self._tries += 1
+        if self._tries > 72 or app().sm.current != "login":
+            self._poll.cancel()
+            return
+        a = app()
+
+        def ok(res):
+            if res.get("status") == "ok" and self._poll:
+                self._poll.cancel()
+                a.on_login(res)
+
+        def bad(res):
+            if self._poll:
+                self._poll.cancel()
+            toast(res.get("message", "تعذّر الدخول بحساب Google"), "err")
+
+        a.api.get(f"/api/auth/google/poll?nonce={self._nonce}&role={self.role}", ok, bad, quiet=True)
+
     def submit(self):
         ident, pw = self.ident.text, self.pw.input.text
         if not ident or not pw:
             toast("أدخل الرقم الجامعي أو البريد وكلمة المرور", "err")
             return
         a = app()
-        a.api.post("/api/auth/login", {"identifier": ident, "password": pw, "device_id": a.device_id}, a.on_login)
+        a.api.post("/api/auth/login", {"identifier": ident, "password": pw, "device_id": a.device_id,
+                                       "role": self.role}, a.on_login)
 
 
 class ActivateScreen(Screen):
