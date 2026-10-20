@@ -1,4 +1,4 @@
 # عنوان الخادم الافتراضي الذي يظهر في التطبيق عند أول تشغيل.
 # ضع هنا عنوان خادم الجامعة قبل بناء الـ APK، مثال: "https://attendance.example.edu.iq"
 # (يمكن للمستخدم تغييره من «إعدادات الخادم» في التطبيق).
-DEFAULT_SERVER = ""
+DEFAULT_SERVER = "https://maqal.pythonanywhere.com"
